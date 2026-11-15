@@ -1,0 +1,32 @@
+
+use std::result::Result
+use std::option::Option
+use std::string::String
+use std::pointer::NonNullPointer
+
+use net_device::MacAddress
+use interface::build_ipv4
+use net_device::NetDevice
+use interface::Interface
+
+#[no_mangle]
+fn main()->i32{
+    /// Open a layer 2 NetDevice then wrap it inside an layer 3 Interface that owns the
+    /// layer 3 IP address
+    Result<NetDevice,str> netDevice = NetDevice::open_tap(String::new("tap0"),String::new("10.0.0.1/24"),MacAddress::new_unsafe(0x02,0,0,0,0,0x02))
+
+    match netDevice{
+        Result::<NetDevice,str>::Ok(net) => {
+            Interface iface = Interface::new_unsafe(net,build_ipv4(10,0,0,2),build_ipv4(255,255,255,0))
+
+            while true{
+
+            }
+        }
+        Result::<NetDevice,str>::Err(err) => {
+            netDevice.expect("opening tap failed miserably..bye")
+        }
+    }
+
+    return 0
+}

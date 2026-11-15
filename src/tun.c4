@@ -1,0 +1,291 @@
+
+use std::result::Result
+use std::option::Option
+use std::string::String
+use std::pointer::NonNullPointer
+
+use std::linux::file::linux_open
+use std::linux::file::linux_read
+use std::linux::file::linux_write
+use std::linux::file::linux_close
+use std::linux::file::ioctl
+
+use std::linux::socket::FileFlags
+
+use std::memory::memory::allocate
+use std::memory::malloc::free
+
+use std::process::cmd
+
+
+foreign "C"{
+    fn printf(char *fmt,...)->i32
+}
+
+
+
+/// _IOW('T',202,int)
+const u64 TUNSETIFF = 0x400454ca
+const i16 IFF_TUN   = 0x0001
+const i16 IFF_TAP   = 0x0002
+
+/// no 4-byte tun_pi prefix on each packet/frame
+const i16 IFF_NO_PI = 0x1000
+
+
+enum TunMode{
+    Tun
+    Tap
+}
+
+
+
+
+// struct ifreq: name + flags at the front, padde
+/// This is the linux struct ifreq(name + flags at the front, padded to the real 40-byte
+/// sizeof(struct ifreq)), therefore the kernel's copy_from_user is happy
+
+#[cfg(os="linux")]
+struct IfReq{
+    char [16]name
+    i16 flags
+    char [22]padding
+}
+
+impl IfReq{
+    fn init(String name,i16 flags)->bool{
+        i32 index = 0
+
+        /// copy up to 15 characters, leaving space for the null terminator
+        while (index < name.length()) and (index < 15){
+            self->name[index] = name.at(index)
+            index            += 1
+        }
+        
+        self->name[index] = 0
+        self->name[15]    = 0
+        self->flags       = flags
+
+        return true
+    }
+
+    #[static(true)]
+    fn new_unsafe(String name,i16 flags)->IfReq{
+        IfReq node
+        node.init(name,flags)
+
+        return node
+    }
+
+    fn get_name()->str{
+        return self->name
+    }
+}
+
+
+// Heap frame buffer; sized via sizeof(FrameBuffer) by allocate<T>().
+// 2048 comfortably holds a 1514-byte Ethernet frame (1500 MTU + 14 header).
+//
+
+/// 2048 comfortably holds a 1514-byte ethernet frame (1500 MTU + 14 header)
+struct FrameBuffer{
+    u8 [2048]bytes
+}
+
+impl FrameBuffer{
+    #[static(true)]
+    fn new()->Option<NonNullPointer<FrameBuffer> >{
+        return allocate<FrameBuffer>()
+    }
+}
+
+
+#[cfg(os="linux")]
+struct TunDevice{
+    i32 fileDescriptor
+    String name
+}
+
+
+#[cfg(os="linux")]
+impl TunDevice{
+    fn init(i32 fileDescriptor,String name)->bool{
+        self->fileDescriptor = fileDescriptor
+        self->name           = name
+
+        return true
+    }
+
+    #[static(true)]
+    fn new_unsafe(i32 fileDescriptor,String name)->TunDevice{
+        TunDevice node
+        node.init(fileDescriptor,name)
+
+        return node
+    }
+
+    /// This subroutine opens a /dev/net/tun and attaches a TUN (layer 3) or a
+    /// TAP (layer 2) interface
+    /// The requested name maybe an empty string to let the kernel pick (tunN / tapN)
+    /// respectively
+    #[static(true)]
+    fn open(String requestedName,TunMode mode)->Result<TunDevice,str>{
+        Result<i32,str> result = linux_open("/dev/net/tun", FileFlags::O_RDWR, 0)
+
+        match result{
+            Result::<i32,str>::Ok(fd) => {
+                i16 flags = IFF_NO_PI
+
+                if mode == TunMode::Tap{
+                    flags = flags | IFF_TAP
+                }
+                else{
+                    flags = flags | IFF_TUN
+                }
+
+                IfReq request = IfReq::new_unsafe(requestedName,flags)
+                i32 status    = ioctl(fd,TUNSETIFF,&request as i8 *)
+
+                if status < 0{
+                    linux_close(fd)
+                    return Result::<TunDevice,str>::Err("TUNSETIFF ioctl failed")
+                }
+
+
+                /// The kernel writes the assigned name back into our buffer
+                /// We use it just to be safe
+                String assignedName = String::new(request.get_name())
+
+                return Result::<TunDevice,str>::Ok(TunDevice::new_unsafe(fd,assignedName))
+            }
+            Result::<i32,str>::Err(err) => {
+                return Result::<TunDevice,str>::Err(err)
+            }
+        }
+    }
+
+    #[static(true)]
+    fn open_tun(String name)->Result<TunDevice,str>{
+        return TunDevice::open(name,TunMode::Tun)
+    }
+
+    #[static(true)]
+    fn open_tap(String name)->Result<TunDevice,str>{
+        return TunDevice::open(name,TunMode::Tap)
+    }
+
+    /// This subroutine brings up the link,no address
+    /// This is intended to be used only when your own stack owns the layer 3 and you don't
+    /// want the kernel answering ARP?ICMP on the interface
+    /// This requires CAP_NET_ADMIN (you could just run as root)
+    fn set_up()->Result<bool,str>{
+        return cmd("/usr/sbin/ip",".",4,"link","set",self->name.cstring(),"up")
+    }
+ 
+    /// This subroutine brings up the interface and gives the host a CIDR address on it via the
+    /// cmd API
+    /// This is useful for testing, i.e. the host can the route into the subneet while your stack
+    /// claims a different address e.g. 10.0.0.1/24
+    fn bring_up(String address)->Result<bool,str>{
+        Result<bool,str> result = cmd("/usr/sbin/ip",".",5,"addr","add",address.cstring(),"dev",self->name.cstring())
+
+        match result{
+            Result::<bool,str>::Ok(ok) => {
+                return cmd("/sbin/ip", ".",4,"link","set", self->name.cstring(),"up")
+            }
+            Result::<bool,str>::Err(err) => {
+                return Result::<bool,str>::Err(err)
+            }
+        }
+    }
+
+    /// This subroutine reads a frame or a packet depending on the TunKind
+    /// One read equals one layer 2 ethernet frame (TAP) or one layer 3 packet
+    /// (TUN)
+    /// It returns the number of bytes read
+    fn read_packet(NonNullPointer<u8> buffer,u64 length)->Result<i32,str>{
+        return linux_read(self->fileDescriptor,buffer.as_pointer(),length)
+    }
+
+    /// This subroutine writes a frame or a packet depending on the TunKind
+    /// One write equals one layer 2 ethernet frame (TAP) or one layer 3 packet
+    /// (TUN)
+    /// It returns the number of bytes written
+    fn write_packet(NonNullPointer<u8> buffer,u64 length)->Result<i32,str>{
+        return linux_write(self->fileDescriptor,buffer.as_pointer(),length)
+    }
+
+    fn get_name()->String{
+        return self->name
+    }
+
+    fn get_file_descriptor()->i32{
+        return self->fileDescriptor
+    }
+
+    fn close_device()->Result<i32,str>{
+        return linux_close(self->fileDescriptor)
+    }
+}
+
+
+/// This subroutine is just a test check
+/// It opens tap0,assigns the host 10.0.0.1/24, brings up the link, prints each frame's
+/// length + the ethertype and echoes it back byte-for-byte
+/// This solely exists to prove that frames flow in and out
+/// Ofcourse this uses TAP not TUN
+#[cfg(os="linux")]
+fn tap_loopback_check()->Result<bool,str>{
+    Result<TunDevice,str> tunDevice = TunDevice::open_tap(String::new("tap0"))
+
+    match tunDevice{
+        Result::<TunDevice,str>::Ok(device) => {
+            Result<bool,str> result = device.bring_up(String::new("10.0.0.1/24"))
+
+            match result{
+                Result::<bool,str>::Ok(ok) => {
+
+                }
+                Result::<bool,str>::Err(err) => {
+                    return Result::<bool,str>::Err(err)
+                }
+            }
+
+            Option<NonNullPointer<FrameBuffer> > allocation = FrameBuffer::new()
+
+            if allocation.is_none(){
+                return Result::<bool,str>::Err("frame buffer allocation failed")
+            }
+
+            NonNullPointer<FrameBuffer> buffer = allocation.unwrap()
+
+            defer free(buffer.as_pointer() as void *)
+
+            while true{
+                Result<i32,str> readResult = device.read_packet(NonNullPointer::<u8>::new_unsafe(buffer.as_pointer()->bytes),2048)
+
+                match readResult{
+                    Result::<i32,str>::Ok(bytesRead) => {
+                        
+                        i32 highByte  = (buffer.as_pointer()->bytes[12] as i32) & 0xff
+                        i32 lowByte   = (buffer.as_pointer()->bytes[13] as i32) & 0xff
+                        i32 etherType = (highByte << 8) | lowByte
+
+                        printf("received %d bytes, ethertype 0x%04x\n",bytesRead,etherType)
+
+                        device.write_packet(NonNullPointer::<u8>::new_unsafe(buffer.as_pointer()->bytes),bytesRead as u64)
+                    }
+                    Result::<i32,str>::Err(err) => {
+                        return Result::<bool,str>::Err(err)
+                    }
+                }
+            }
+
+            return Result::<bool,str>::Ok(true)
+        }
+        Result::<TunDevice,str>::Err(err) => {
+            return Result::<bool,str>::Err(err)
+        }
+    }
+
+}

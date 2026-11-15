@@ -1,0 +1,163 @@
+
+use std::result::Result
+use std::option::Option
+use std::string::String
+use std::pointer::NonNullPointer
+
+use tun::TunDevice
+
+
+
+struct MacAddress{
+    char [6]bytes
+}
+
+impl MacAddress{
+    fn init(u8 b0, u8 b1,u8 b2,u8 b3,u8 b4,u8 b5)->bool{
+        self->bytes[0] = b0 as char
+        self->bytes[1] = b1 as char
+        self->bytes[2] = b2 as char
+        self->bytes[3] = b3 as char
+        self->bytes[4] = b4 as char
+        self->bytes[5] = b5 as char
+
+        return true
+    }
+
+    #[static(true)]
+    fn new_unsafe(u8 b0,u8 b1,u8 b2,u8 b3,u8 b4,u8 b5)->MacAddress{
+        MacAddress node
+        node.init(b0,b1,b2,b3,b4,b5)
+
+        return node
+    }
+
+    fn at(u64 index)->u8{
+        return self->bytes[index] as u8
+    }
+
+    fn equals(MacAddress other)->bool{
+        u64 index = 0
+
+        while index < 6{
+            if self->at(index) != other.at(index){
+                return false
+            }
+
+            index += 1
+        }
+
+        return true
+    }
+
+    fn is_broadcast()->bool{
+        u64 index = 0
+
+        while index < 6{
+            u8 value = self->at(index) as u8
+
+            if value != 0xff{
+                return false
+            }
+
+            index += 1
+        }
+
+        return true
+    }
+}
+
+
+
+/// Due to lack of traits,we'll use NetDevice as a blackbox for upper layers to receive and 
+/// transmit packets without being tied to the network hardware
+/// This ultimiately means that the tcp/ip stak written on top of this will be platform 
+/// independent...I think!
+/// A new hardware configuration only needs it's network driver implementer to provide a 
+/// network device with the methods receive and transmit
+
+#[cfg(os="linux")]
+struct NetDevice{
+    TunDevice device
+    MacAddress macAddress
+}
+
+
+#[cfg(os="linux")]
+impl NetDevice{
+    fn init(TunDevice device,MacAddress macAddress)->bool{
+        self->device     = device
+        self->macAddress = macAddress
+
+        return true
+    }
+
+
+    #[static(true)]
+    fn new_unsafe(TunDevice device,MacAddress macAddress)->NetDevice{
+        NetDevice node
+        node.init(device,macAddress)
+
+        return node
+    }
+
+
+    /// This subroutine opens a TAP interface,giving the host the hostAddress
+    /// It wraps it as NetDevice carrying the stack's own mac address
+    ///
+    /// example call:
+    ///     NetDevice::open_tap(String::new("tap0"),String::new("10.0.0.1/24"), MacAddress::new(0x02,0,0,0,0,0x02))
+
+    #[static(true)]
+    fn open_tap(String name,String hostAddress,MacAddress macAddress)->Result<NetDevice,str>{
+        Result<TunDevice,str> tunDevice = TunDevice::open_tap(name)
+
+        match tunDevice{
+            Result::<TunDevice,str>::Ok(device) => {
+                Result<bool,str> isUp = device.bring_up(hostAddress)
+
+                match isUp{
+                    Result::<bool,str>::Ok(ok) => {
+                        return Result::<NetDevice,str>::Ok(NetDevice::new_unsafe(device,macAddress))
+                    }
+                    Result::<bool,str>::Err(err) => {
+                        return Result::<NetDevice,str>::Err(err)
+                    }
+                }
+            }
+            Result::<TunDevice,str>::Err(err) => {
+                return Result::<NetDevice,str>::Err(err)
+            }
+        }
+    }
+
+    /// This subroutine receives ethernet frames from the wire
+    /// One receive equals one ethernet frame into the buffer
+    /// This is the first of the only two methods that a bare-metal NIC backend must and/or
+    /// would need to reimplement
+    fn receive(NonNullPointer<u8> buffer,u64 length)->Result<i32,str>{
+        return self->device.read_packet(buffer,length)
+    }
+
+
+    /// This subroutine sends ethernet frames on the wire
+    /// One transmit equals one ethernet frame sent
+    /// This is the second and last of the only two methods that a bare-metal NIC backend must and/or
+    /// would need to reimplement
+    fn transmit(NonNullPointer<u8> buffer,u64 length)->Result<i32,str>{
+        return self->device.write_packet(buffer,length)
+    }
+
+    fn get_mac()->MacAddress{
+        return self->macAddress
+    }
+
+    fn get_name()->String{
+        return self->device.get_name()
+    }
+
+    fn close()->Result<i32,str>{
+        return self->device.close_device()
+    }
+}
+

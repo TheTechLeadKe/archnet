@@ -1,0 +1,59 @@
+use std::result::Result
+use std::pointer::NonNullPointer
+use net_device::NetDevice
+
+
+/// This subroutine builds an IPv4 address as an u32 with 'a' in the high byte (a.b.c.d)
+/// This is the host-order, therefore we must byte swap when you serialize on to the wire
+fn build_ipv4(u8 a,u8 b,u8 c,u8 d)->u32{
+    return ((a as u32) << 24) | ((b as u32) << 16) | ((c as u32) << 8) | (d as u32)
+}
+
+
+
+#[cfg(os="linux")]
+struct Interface{
+    NetDevice device
+    u32 address
+    u32 netmask
+}
+
+
+#[cfg(os="linux")]
+impl Interface{
+    fn init(NetDevice device,u32 address,u32 netmask)->bool{
+        self->device  = device
+        self->address = address
+        self->netmask = netmask
+
+        return true
+    }
+
+    #[static(true)]
+    fn new_unsafe(NetDevice device,u32 address,u32 netmask)->Interface{
+        Interface node
+        node.init(device,address,netmask)
+
+        return node
+    }
+
+    fn get_ipv4()->u32{
+        return self->address
+    }
+
+    fn get_netmask()->u32{
+        return self->netmask
+    }
+
+    fn get_device()->NetDevice *{
+        return &self->device
+    }
+
+    fn receive(NonNullPointer<u8> buffer,u64 length)->Result<i32,str>{
+        return self->device.receive(buffer,length)
+    }
+
+    fn transmit(NonNullPointer<u8> buffer,u64 length)->Result<i32,str>{
+        return self->device.transmit(buffer,length)
+    }
+}

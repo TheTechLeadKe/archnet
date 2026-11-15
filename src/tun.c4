@@ -83,10 +83,8 @@ impl IfReq{
 }
 
 
-// Heap frame buffer; sized via sizeof(FrameBuffer) by allocate<T>().
-// 2048 comfortably holds a 1514-byte Ethernet frame (1500 MTU + 14 header).
-//
-
+/// This is a heap backed frame buffer which is sized via sizeof(FrameBuffer) by
+/// allocate<FrameBuffer>()
 /// 2048 comfortably holds a 1514-byte ethernet frame (1500 MTU + 14 header)
 struct FrameBuffer{
     u8 [2048]bytes
